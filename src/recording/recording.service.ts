@@ -1,286 +1,363 @@
-import { BadRequestException, Injectable, UnauthorizedException } from '@nestjs/common';
-import { protos, SpeechClient } from '@google-cloud/speech';
+import { BadRequestException, Injectable } from '@nestjs/common';
+import { OAuth2Client } from 'google-auth-library';
+import { drive_v3, google } from 'googleapis';
+import { Readable } from 'stream';
+import { ConfigService } from '@nestjs/config';
 import { VertexAI } from '@google-cloud/vertexai';
-import { Storage } from '@google-cloud/storage';
-import { AuthService } from '../auth/auth.service';
-import * as path from 'path';
-import * as process from 'node:process';
-import { Buffer } from 'node:buffer';
-import { GoogleAuth } from 'google-auth-library';
-
-export interface TranscriptionResult {
-  transcript: string;
-  confidence: number;
-  words: {
-    word: string;
-    startTime: number;
-    endTime: number;
-  }[];
-}
-
+import * as serviceAccount from './scribe-bot.json';
+import * as path from 'node:path';
+import * as fs from 'node:fs';
 
 @Injectable()
 export class RecordingService {
-  private speechClient: SpeechClient;
-  private storage: Storage;
-  private vertexAI: VertexAI;
+  vertexAi: VertexAI;
 
-  constructor(private authService: AuthService) {
-    this.storage = new Storage();
-    this.vertexAI = new VertexAI({ project: process.env.GOOGLE_PROJECT_ID });
+  constructor(private configService: ConfigService) {
+    this.vertexAi = new VertexAI({
+      project: this.configService.get('GOOGLE_PROJECT_ID'),
+      location: 'us-central1',
+      googleAuthOptions: {
+        credentials: serviceAccount,
+        scopes: ['https://www.googleapis.com/auth/cloud-platform'],
+      },
+    });
   }
 
-  async startRecording(userId: string) {
+  async startRecording(accessToken: string): Promise<{ recordingId: string; message: string }> {
     try {
-      const recordingId = `recording-${userId}-${Date.now()}`;
+      const drive = this.getDriveService(accessToken);
 
-      // Create a folder in Google Cloud Storage for this recording
-      const bucket = this.storage.bucket(process.env.GOOGLE_STORAGE_BUCKET!);
-      await bucket.file(`${recordingId}/`).save('');
+      // Create a folder for the recording
+      const folderMetadata = {
+        name: `Medical-Recording-${Date.now()}`,
+        mimeType: 'application/vnd.google-apps.folder',
+      };
+
+      const folder = await drive.files.create({
+        requestBody: folderMetadata,
+        fields: 'id, name',
+      });
 
       return {
-        recordingId,
-        message: 'Recording session initialized successfully',
+        recordingId: folder.data.id!,
+        message: `Recording initialized in your Google Drive: ${folder.data.name}`,
       };
     } catch (error) {
-      throw new BadRequestException('Failed to initialize recording session');
+      console.error('Start recording error:', error);
+      throw new BadRequestException('Failed to initialize recording in your Google Drive');
     }
+  }
+
+  bufferToStream(buffer: Buffer): any {
+    const stream = new Readable();
+    stream.push(buffer);
+    stream.push(null);
+    return stream;
   }
 
   async processAudioChunk(
     recordingId: string,
     chunk: Buffer,
     chunkNumber: number,
-    userId: string,
-    refreshToken: string,
-  ) {
+    accessToken: string,
+  ): Promise<{ message: string; chunkNumber: number }> {
     try {
-      // Get fresh access token
-      const credentials = await this.authService.refreshGoogleToken(refreshToken);
+      const drive = this.getDriveService(accessToken);
 
-      // Save chunk to Cloud Storage
-      const bucket = this.storage.bucket(process.env.GOOGLE_STORAGE_BUCKET!);
-      const chunkFileName = `${recordingId}/chunk-${chunkNumber}.wav`;
-      const file = bucket.file(chunkFileName);
+      const fileMetadata = {
+        name: `chunk-${chunkNumber}.wav`,
+        parents: [recordingId],
+      };
 
+      // Convert Buffer to Readable stream
+      const mediaStream = this.bufferToStream(chunk);
 
-      await file.save(chunk, {
-        resumable: false,
-        validation: false,
-        contentType: 'audio/wav',
+      await drive.files.create({
+        requestBody: fileMetadata,
+        media: {
+          mimeType: 'audio/wav',
+          body: mediaStream,
+        },
+        fields: 'id',
       });
 
       return {
-        message: 'Audio chunk processed successfully',
+        message: 'Audio chunk saved to your Drive',
         chunkNumber,
       };
     } catch (error) {
-      throw new BadRequestException('Failed to process audio chunk');
+      console.error('Process chunk error:', error.message);
+      // Add more detailed error information
+      throw new BadRequestException(`Failed to save audio chunk: ${error.message}`);
     }
   }
 
-  async stopRecording(
-    recordingId: string,
-    userId: string,
-    refreshToken: string,
-  ) {
-    try {
-      // Get fresh access token
-      const credentials = await this.authService.refreshGoogleToken(refreshToken);
-
-      // Combine all chunks
-      const combinedAudio = await this.combineAudioChunks(recordingId);
-
-      // Transcribe the combined audio
-      const transcription = await this.transcribeAudio(
-        combinedAudio,
-        credentials.access_token,
-      );
-
-      // Summarize the transcription
-      const summary = await this.summarizeTranscript(
-        transcription.transcript,
-        credentials.refresh_token,
-      );
-
-      // Save results
-      await this.saveResults(recordingId, {
-        transcription,
-        summary,
-      });
-
-      return {
-        recordingId,
-        transcript: transcription.transcript,
-        summary,
-        confidence: transcription.confidence,
-        words: transcription.words,
-      };
-    } catch (error) {
-      throw new BadRequestException('Failed to complete recording processing');
-    }
-  }
-
-  private async combineAudioChunks(recordingId: string): Promise<Buffer> {
-    const bucket = this.storage.bucket(process.env.GOOGLE_STORAGE_BUCKET!);
-    const [files] = await bucket.getFiles({
-      prefix: `${recordingId}/chunk-`,
-    });
-
-    // Sort files by chunk number
-    files.sort((a, b) => {
-      const aNum = parseInt(path.basename(a.name).split('-')[1]);
-      const bNum = parseInt(path.basename(b.name).split('-')[1]);
-      return aNum - bNum;
-    });
-
-    // Combine audio chunks
-    const chunks: Buffer[] = [];
-    for (const file of files) {
-      const [data] = await file.download();
-      chunks.push(<Buffer>data);
-    }
-
-    return Buffer.concat(chunks);
-  }
-
-  async transcribeAudio(
-    audioData: Buffer,
-    accessToken: string,
-  ): Promise<any> {
-    try {
-      const auth = new GoogleAuth({
-        credentials: {},
-        scopes: ['https://www.googleapis.com/auth/cloud-platform'],
-      });
-
-      this.speechClient = new SpeechClient({
-        credentials: {},
-        auth: auth,
-        headers: {
-          Authorization: `Bearer ${accessToken}`,
-        },
-      });
-
-      const request: protos.google.cloud.speech.v1.IRecognizeRequest = {
-        audio: {
-          content: audioData.toString('base64'),
-        },
-        config: {
-          encoding: protos.google.cloud.speech.v1.RecognitionConfig.AudioEncoding.LINEAR16,
-          sampleRateHertz: 16000,
-          languageCode: 'en-US',
-          enableWordTimeOffsets: true,
-          enableAutomaticPunctuation: true,
-          model: 'latest_long',
-          useEnhanced: true,
-        },
-      };
-
-      const [response] = await this.speechClient.recognize(request);
-      const result = response.results?.[0];
-
-      if (!result?.alternatives?.[0]) {
-        throw new Error('No transcription results available');
-      }
-
-      return {
-        transcript: result.alternatives[0].transcript ?? '',
-        confidence: result.alternatives[0].confidence ?? 0,
-        words: result.alternatives[0].words?.map(word => ({
-          word: word.word ?? '',
-          startTime: Number(word.startTime?.seconds ?? 0),
-          endTime: Number(word.endTime?.seconds ?? 0),
-        })) ?? [],
-      };
-    } catch (error) {
-      throw new UnauthorizedException('Failed to transcribe audio');
-    }
-  }
-
-  private async summarizeTranscript(
-    transcript: string,
-    accessToken: string,
-  ): Promise<string> {
-    try {
-      // Initialize Vertex AI with authentication
-      this.vertexAI = new VertexAI({
-        project: process.env.GOOGLE_PROJECT_ID,
-        location: 'us-central1',
-        googleAuthOptions: {
-          credentials: {
-            refresh_token: accessToken,
-          },
-          scopes: ['https://www.googleapis.com/auth/cloud-platform'],
-        },
-      });
-
-      const model = this.vertexAI.preview.getGenerativeModel({
-        model: 'gemini-pro',
-      });
-
-      const prompt = `Please provide a concise summary of this meeting transcript, 
-      highlighting the main points discussed, any decisions made, and action items:
-      
-      ${transcript}
-      
-      Format the summary with the following sections:
-      - Key Points
-      - Decisions Made
-      - Action Items`;
-
-      const result = await model.generateContent(prompt);
-      const response = await result.response;
-      return response.promptFeedback.blockReasonMessage ?? 'No summary generated';
-    } catch (error) {
-      console.log('Summarization error:', error);
-      throw new UnauthorizedException('Failed to summarize transcript');
-    }
-  }
-
-  private async saveResults(
-    recordingId: string,
-    results: {
-      transcription: TranscriptionResult;
-      summary: string;
-    },
-  ) {
-    try {
-      const bucket = this.storage.bucket(process.env.GOOGLE_STORAGE_BUCKET!);
-      const resultsFile = bucket.file(`${recordingId}/results.json`);
-
-      await resultsFile.save(JSON.stringify(results), {
-        resumable: false,
-        contentType: 'audio/wav',
-      });
-    } catch (error) {
-      console.error('Failed to save results:', error);
-      throw new BadRequestException('Failed to save recording results');
-    }
-  }
-
-  async getRecordingResults(recordingId: string): Promise<{
-    transcription: TranscriptionResult;
+  async stopRecording(recordingId: string, accessToken: string): Promise<{
+    transcript: string;
     summary: string;
   }> {
     try {
-      const bucket = this.storage.bucket(process.env.GOOGLE_STORAGE_BUCKET!);
-      const resultsFile = bucket.file(`${recordingId}/results.json`);
+      const drive = this.getDriveService(accessToken);
 
-      const [data] = await resultsFile.download();
-      return JSON.parse(data.toString());
+      // Get all audio chunks
+      const chunks = await drive.files.list({
+        q: `'${recordingId}' in parents and mimeType='audio/wav'`,
+        orderBy: 'name',
+        fields: 'files(id, name)',
+      });
+
+
+      if (!chunks.data.files?.length) {
+        throw new BadRequestException('No audio chunks found');
+      }
+
+      // Combine audio chunks
+      const audioBuffers: Buffer[] = [];
+      for (const file of chunks.data.files) {
+        const response: any = await drive.files.get(
+          { fileId: file.id!, alt: 'media' },
+          { responseType: 'arraybuffer' },
+        );
+        audioBuffers.push(Buffer.from(response.data));
+      }
+      const combinedAudio = Buffer.concat(audioBuffers);
+      console.log(combinedAudio);
+      // Transcribe using user's Speech-to-Text
+      const transcript = await this.transcribeAudio(combinedAudio, accessToken);
+
+      // Summarize using user's Vertex AI
+      const summary = await this.summarizeTranscript(transcript);
+      console.log(summary);
+      // Save results back to user's Drive
+      await this.saveResultsToDrive(recordingId, transcript, JSON.stringify(summary), accessToken);
+
+      return { transcript, summary };
     } catch (error) {
-      throw new BadRequestException('Failed to retrieve recording results');
+      console.error('Stop recording error:', error);
+      throw new BadRequestException('Failed to process recording');
     }
   }
 
-  async deleteRecording(recordingId: string): Promise<void> {
+
+
+  private async transcribeAudio(audioBuffer: Buffer, accessToken: string): Promise<string> {
     try {
-      const bucket = this.storage.bucket(process.env.GOOGLE_STORAGE_BUCKET!);
-      await bucket.deleteFiles({
-        prefix: `${recordingId}/`,
-      });
+      console.log('Starting transcription...');
+      console.log('Audio buffer size:', audioBuffer.length);
+
+      const speech = google.speech('v1').speech;
+      const auth = new OAuth2Client();
+      auth.setCredentials({ access_token: accessToken });
+
+      // Configure for WebM audio
+      const config = {
+        encoding: 'WEBM_OPUS', // Changed to WebM format
+        sampleRateHertz: 48000,
+        languageCode: 'en-US',
+        enableAutomaticPunctuation: true,
+        model: 'default',
+        useEnhanced: true,
+        audioChannelCount: 1,
+      };
+
+      console.log('Speech-to-Text config:', config);
+
+      const request = {
+        auth,
+        requestBody: {
+          audio: {
+            content: audioBuffer.toString('base64')
+          },
+          config,
+        },
+      };
+
+      // Save audio for debugging
+
+      const response = await speech.recognize(request);
+      console.log('API Response:', JSON.stringify(response.data, null, 2));
+
+      if (!response?.data?.results || response.data.results.length === 0) {
+        throw new Error('No speech detected in the audio');
+      }
+
+      const transcript = response.data.results
+        .map(result => result.alternatives?.[0]?.transcript || '')
+        .join(' ');
+
+      console.log('Transcript:', transcript);
+      return transcript;
+
     } catch (error) {
+      console.error('Transcription error:', error);
+      throw error;
+    }
+  }
+
+  private async summarizeTranscript(transcript: string): Promise<any> {
+    try {
+      const model = this.vertexAi.preview.getGenerativeModel({
+        model: 'gemini-pro',
+        generationConfig: {
+          maxOutputTokens: 1024,
+          temperature: 0.2,
+          topP: 0.8,
+          topK: 40,
+        },
+      });
+
+      const prompt = `Summarize this medical conversation, highlighting key points, diagnoses, and follow-up actions:
+
+${transcript}
+
+Format the summary with these sections:
+- Key Points
+- Medical Observations
+- Follow-up Actions`;
+
+      const result = await model.generateContent(prompt);
+      return result.response.candidates[0].content.parts[0].text;
+    } catch (error) {
+      console.error('Summarization error:', error);
+
+      if (error.message?.includes('permission denied') || error.message?.includes('unauthorized')) {
+        throw new BadRequestException('Vertex AI access denied. Please check service account configuration.');
+      }
+
+      throw new BadRequestException(`Failed to summarize transcript: ${error.message}`);
+    }
+  }
+
+  private async saveResultsToDrive(
+    folderId: string,
+    transcript: string,
+    summary: string,
+    accessToken: string,
+  ): Promise<void> {
+    const drive = this.getDriveService(accessToken);
+
+    const files = [
+      { name: 'transcript.txt', content: transcript },
+      { name: 'summary.txt', content: summary },
+    ];
+
+    for (const file of files) {
+      const fileMetadata = {
+        name: file.name,
+        parents: [folderId],
+      };
+
+      await drive.files.create({
+        requestBody: fileMetadata,
+        media: {
+          mimeType: 'text/plain',
+          body: file.content,
+        },
+        fields: 'id',
+      });
+    }
+  }
+
+  private getDriveService(accessToken: string): drive_v3.Drive {
+    const auth = new OAuth2Client();
+    auth.setCredentials({ access_token: accessToken });
+    return google.drive({ version: 'v3', auth });
+  }
+
+  async getResults(recordingId: string, accessToken: string): Promise<{
+    transcript: string;
+    summary: string;
+  }> {
+    try {
+      const drive = this.getDriveService(accessToken);
+
+      const files = await drive.files.list({
+        q: `'${recordingId}' in parents and (name='transcript.txt' or name='summary.txt')`,
+        fields: 'files(id, name)',
+      });
+
+      if (!files.data.files?.length) {
+        throw new BadRequestException('Results not found');
+      }
+
+      const results: { transcript: string; summary: string } = {
+        transcript: '',
+        summary: '',
+      };
+
+      for (const file of files.data.files) {
+        const response = await drive.files.get(
+          { fileId: file.id!, alt: 'media' },
+          { responseType: 'text' },
+        );
+
+        // Fix for Schema$File type error
+        if (typeof response.data === 'string') {
+          if (file.name === 'transcript.txt') {
+            results.transcript = response.data;
+          } else if (file.name === 'summary.txt') {
+            results.summary = response.data;
+          }
+        }
+      }
+
+      return results;
+    } catch (error) {
+      console.error('Get results error:', error);
+      throw new BadRequestException('Failed to retrieve results');
+    }
+  }
+
+  async getRecordingResults(recordingId: string, accessToken: string): Promise<{
+    transcript: string;
+    summary: string;
+  }> {
+    try {
+      const drive = this.getDriveService(accessToken);
+
+      const files = await drive.files.list({
+        q: `'${recordingId}' in parents and (name='transcript.txt' or name='summary.txt')`,
+        fields: 'files(id, name)',
+      });
+
+      if (!files.data.files?.length) {
+        throw new BadRequestException('Results not found');
+      }
+
+      const results: { transcript: string; summary: string } = {
+        transcript: '',
+        summary: '',
+      };
+
+      for (const file of files.data.files) {
+        const response = await drive.files.get(
+          { fileId: file.id!, alt: 'media' },
+          { responseType: 'text' },
+        );
+
+        // Ensure response.data is a string
+        const content = response.data?.toString() || '';
+
+        if (file.name === 'transcript.txt') {
+          results.transcript = content;
+        } else if (file.name === 'summary.txt') {
+          results.summary = content;
+        }
+      }
+
+      return results;
+    } catch (error) {
+      console.error('Get results error:', error);
+      throw new BadRequestException('Failed to retrieve results');
+    }
+  }
+
+  async deleteRecording(recordingId: string, accessToken: string): Promise<void> {
+    try {
+      const drive = this.getDriveService(accessToken);
+      await drive.files.delete({ fileId: recordingId });
+    } catch (error) {
+      console.error('Delete recording error:', error);
       throw new BadRequestException('Failed to delete recording');
     }
   }

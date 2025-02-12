@@ -39,6 +39,14 @@ export class AuthService {
       'https://www.googleapis.com/auth/cloud-translation',
       'https://www.googleapis.com/auth/cloud-vision',
       'https://www.googleapis.com/auth/cloud-speech',
+      'https://www.googleapis.com/auth/devstorage.full_control',
+      'https://www.googleapis.com/auth/cloud-platform',
+      'https://www.googleapis.com/auth/drive.appdata',
+      'https://www.googleapis.com/auth/drive.appfolder',
+      'https://www.googleapis.com/auth/drive.file',
+      'https://www.googleapis.com/auth/drive.resource',
+      'https://www.googleapis.com/auth/drive',
+
     ];
 
     return this.oauth2Client.generateAuthUrl({
@@ -142,5 +150,30 @@ export class AuthService {
 
   async validateUser(payload: any) {
     return payload;
+  }
+
+  private async revokeGoogleToken(token: string): Promise<void> {
+    try {
+      await this.oauth2Client.revokeToken(token);
+    } catch (error) {
+      console.error('Token revocation error:', error);
+    }
+  }
+
+  async logout(user: any): Promise<void> {
+    try {
+      // If user has refresh token, revoke it with Google
+      if (user.refreshToken) {
+        await this.revokeGoogleToken(user.refreshToken);
+      }
+
+      // If user has access token, revoke it too
+      if (user.accessToken) {
+        await this.revokeGoogleToken(user.accessToken);
+      }
+    } catch (error) {
+      console.error('Logout process error:', error);
+      // Don't throw - we want the logout to complete even with partial failures
+    }
   }
 }

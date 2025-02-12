@@ -4,14 +4,16 @@ import { RecordingService } from './recording.service';
 import { AuthGuard } from '@nestjs/passport';
 
 @Controller('recording')
-@UseGuards(AuthGuard('google'))
+@UseGuards(AuthGuard('jwt'))
 export class RecordingController {
   constructor(private recordingService: RecordingService) {
   }
 
   @Post('start')
   async startRecording(@Req() req) {
-    return this.recordingService.startRecording(req.user.sub);
+    return this.recordingService.startRecording(
+      req.user.accessToken,
+    );
   }
 
   @Post('chunk/:recordingId/:chunkNumber')
@@ -26,8 +28,7 @@ export class RecordingController {
       recordingId,
       file.buffer,
       chunkNumber,
-      req.user.sub,
-      req.user.refreshToken,
+      req.user.accessToken,
     );
   }
 
@@ -38,18 +39,17 @@ export class RecordingController {
   ) {
     return this.recordingService.stopRecording(
       recordingId,
-      req.user.sub,
-      req.user.refreshToken,
+      req.user.accessToken,
     );
   }
 
   @Get(':recordingId')
-  async getResults(@Param('recordingId') recordingId: string) {
-    return this.recordingService.getRecordingResults(recordingId);
+  async getResults(@Param('recordingId') recordingId: string, @Req() req: any) {
+    return this.recordingService.getRecordingResults(recordingId, req.user.accessToken);
   }
 
   @Delete(':recordingId')
-  async deleteRecording(@Param('recordingId') recordingId: string) {
-    return this.recordingService.deleteRecording(recordingId);
+  async deleteRecording(@Param('recordingId') recordingId: string,@Req() req: any) {
+    return this.recordingService.deleteRecording(recordingId,req.user.accessToken);
   }
 }

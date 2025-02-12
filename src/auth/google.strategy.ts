@@ -22,13 +22,11 @@ export class GoogleStrategy extends PassportStrategy(Strategy, 'google') {
         'https://www.googleapis.com/auth/cloud-translation',
         'https://www.googleapis.com/auth/cloud-vision',
         'https://www.googleapis.com/auth/cloud-speech',
+        'https://www.googleapis.com/auth/drive',
       ],
       access_type: 'offline',
       prompt: 'consent',
     };
-    console.log('Client ID:', clientID?.substring(0, 8) + '...');
-    console.log('Client Secret first chars:', clientSecret?.substring(0, 4) + '...');
-    console.log('Full callback URL:', 'http://localhost:3000/auth/google/callback');
     super(options);
   }
 
@@ -38,8 +36,8 @@ export class GoogleStrategy extends PassportStrategy(Strategy, 'google') {
     done: VerifyCallback,
   ): Promise<any> {
     try {
-      this.logger.debug('Received profile from Google:', profile);
-      this.logger.debug('Access Token:', accessToken?.substring(0, 8) + '...');
+      console.log('Received profile from Google:', profile);
+      console.log('Access Token:', accessToken?.substring(0, 8) + '...');
       const user = {
         email: profile?.emails[0].value,
         firstName: profile?.name.givenName,
@@ -49,6 +47,7 @@ export class GoogleStrategy extends PassportStrategy(Strategy, 'google') {
       };
       done(null, user);
     } catch (error) {
+      console.log(error);
       done(error, null);
     }
   }
