@@ -1,10 +1,12 @@
 # compiled output
 /dist
 /node_modules
+
+/src/recording/scribe-bot.json
 .env
 # Logs
 logs
-*.log
+*.logre
 npm-debug.log*
 pnpm-debug.log*
 yarn-debug.log*
